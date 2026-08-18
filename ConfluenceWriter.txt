@@ -1,0 +1,119 @@
+"""Extract common office documents into safe Confluence storage-format HTML."""
+
+from __future__ import annotations
+
+import html
+from pathlib import Path
+
+
+SUPPORTED_EXTENSIONS = {".docx", ".pptx", ".pdf"}
+
+
+def _escape(value: str) -> str:
+    return html.escape(value, quote=False).replace("\n", "<br/>")
+
+
+def _table_html(rows: list[list[str]]) -> str:
+    rendered_rows = []
+    for row in rows:
+        rendered_rows.append("<tr>" + "".join(f"<td>{_escape(cell)}</td>" for cell in row) + "</tr>")
+    return "<table><tbody>" + "".join(rendered_rows) + "</tbody></table>"
+
+
+def _extract_docx(path: Path) -> tuple[str, list[str], dict]:
+    from docx import Document
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    document = Document(path)
+    fragments: list[str] = []
+    warnings: list[str] = []
+
+    for child in document.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            paragraph = Paragraph(child, document)
+            text = paragraph.text.strip()
+            if not text:
+                continue
+            style_name = paragraph.style.name.lower() if paragraph.style else ""
+            if style_name.startswith("heading"):
+                level = next((char for char in style_name if char.isdigit()), "2")
+                fragments.append(f"<h{level}>{_escape(text)}</h{level}>")
+            elif "bullet" in style_name:
+                fragments.append(f"<ul><li>{_escape(text)}</li></ul>")
+            elif "number" in style_name:
+                fragments.append(f"<ol><li>{_escape(text)}</li></ol>")
+            else:
+                fragments.append(f"<p>{_escape(text)}</p>")
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, document)
+            fragments.append(_table_html([[cell.text.strip() for cell in row.cells] for row in table.rows]))
+
+    if document.inline_shapes:
+        warnings.append(
+            f"{len(document.inline_shapes)} embedded Word image(s) were not copied. "
+            "Upload them to the new page separately if they are important."
+        )
+    return "".join(fragments), warnings, {"units": len(document.paragraphs), "label": "paragraphs"}
+
+
+def _extract_pptx(path: Path) -> tuple[str, list[str], dict]:
+    from pptx import Presentation
+
+    presentation = Presentation(path)
+    fragments: list[str] = []
+    warnings: list[str] = []
+    image_count = 0
+    for number, slide in enumerate(presentation.slides, start=1):
+        fragments.append(f"<h2>Slide {number}</h2>")
+        for shape in slide.shapes:
+            if getattr(shape, "has_text_frame", False):
+                text = shape.text.strip()
+                if text:
+                    tag = "h3" if shape == slide.shapes.title else "p"
+                    fragments.append(f"<{tag}>{_escape(text)}</{tag}>")
+            if getattr(shape, "has_table", False):
+                fragments.append(_table_html([
+                    [cell.text.strip() for cell in row.cells] for row in shape.table.rows
+                ]))
+            if getattr(shape, "shape_type", None) == 13:  # MSO_SHAPE_TYPE.PICTURE
+                image_count += 1
+    if image_count:
+        warnings.append(
+            f"{image_count} PowerPoint image(s) were not copied. Upload them to the new page separately if needed."
+        )
+    return "".join(fragments), warnings, {"units": len(presentation.slides), "label": "slides"}
+
+
+def _extract_pdf(path: Path) -> tuple[str, list[str], dict]:
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    fragments: list[str] = []
+    warnings: list[str] = [
+        "PDF extraction preserves selectable text only; page layout, tables, and images may need manual editing."
+    ]
+    for number, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if text:
+            fragments.append(f"<h2>Page {number}</h2><p>{_escape(text)}</p>")
+    return "".join(fragments), warnings, {"units": len(reader.pages), "label": "pages"}
+
+
+def extract_document(file_path: str) -> dict:
+    """Return a safe Confluence body plus a human-readable preview and warnings."""
+    path = Path(file_path)
+    extension = path.suffix.lower()
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise ValueError("Supported file types are Word (.docx), PowerPoint (.pptx), and PDF (.pdf).")
+    if extension == ".docx":
+        body, warnings, stats = _extract_docx(path)
+    elif extension == ".pptx":
+        body, warnings, stats = _extract_pptx(path)
+    else:
+        body, warnings, stats = _extract_pdf(path)
+    if not body:
+        raise ValueError("No readable text was found in this file.")
+    return {"storage_html": body, "warnings": warnings, "stats": stats}

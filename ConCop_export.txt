@@ -1,0 +1,550 @@
+"""Confluence export engine: selected pages, images, links, and DOCX guidance."""
+
+import io
+from dataclasses import dataclass, field
+from urllib.parse import quote, urljoin, urlparse, urlunparse
+
+import requests
+import urllib3
+from bs4 import BeautifulSoup, NavigableString, Tag
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.image.exceptions import UnrecognizedImageError
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt, RGBColor
+
+urllib3.disable_warnings()
+
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+
+
+def is_token_error(error: Exception) -> bool:
+    """Return whether a Confluence request failed during token authentication."""
+    response = getattr(error, "response", None)
+    return response is not None and response.status_code in {401, 403}
+
+ANSWER_PROFILES = {
+    "brief": {
+        "label": "Brief",
+        "instruction": (
+            "Give a direct answer in 2–4 bullets. Include only the most important "
+            "facts and cite the relevant source page titles."
+        ),
+    },
+    "standard": {
+        "label": "Standard",
+        "instruction": (
+            "Start with a concise answer, then give supporting details in clear "
+            "sections. Cite relevant source page titles and state important uncertainty."
+        ),
+    },
+    "detailed": {
+        "label": "Detailed",
+        "instruction": (
+            "Provide an executive answer followed by structured analysis, evidence, "
+            "implications, exceptions, and source page titles. Separate facts from inferences."
+        ),
+    },
+}
+
+
+@dataclass(frozen=True)
+class ExportSettings:
+    """Connection settings for exactly one export request."""
+
+    base_url: str
+    headers: dict[str, str]
+    cert_path: str | None = None
+
+    @property
+    def verify(self):
+        return self.cert_path or True
+
+
+@dataclass
+class ExportContext:
+    settings: ExportSettings
+    links: list[tuple[str, str, str]] = field(default_factory=list)
+    current_page_title: str = ""
+
+
+def _request(url: str, settings: ExportSettings, **kwargs):
+    response = requests.get(
+        url,
+        headers=settings.headers,
+        verify=settings.verify,
+        timeout=60,
+        **kwargs,
+    )
+    response.raise_for_status()
+    return response
+
+
+def get_space_title(space_key: str, settings: ExportSettings) -> str:
+    response = _request(f"{settings.base_url}/rest/api/space/{space_key}", settings)
+    try:
+        return response.json().get("name", space_key)
+    finally:
+        response.close()
+
+
+def _get_pages(space_key: str, settings: ExportSettings, expand: str) -> list[dict]:
+    """Fetch every current page using Confluence pagination."""
+    pages: list[dict] = []
+    start, batch = 0, 50
+    while True:
+        response = _request(
+            f"{settings.base_url}/rest/api/content",
+            settings,
+            params={
+                "spaceKey": space_key,
+                "type": "page",
+                "status": "current",
+                "expand": expand,
+                "start": start,
+                "limit": batch,
+            },
+        )
+        try:
+            results = response.json().get("results", [])
+        finally:
+            response.close()
+        pages.extend(results)
+        print(f"  Fetched so far: {len(pages)}")
+        if len(results) < batch:
+            return pages
+        start += batch
+
+
+def get_page_metadata(space_key: str, settings: ExportSettings) -> list[dict]:
+    """Fetch only page IDs, titles, and ancestor chains for the scan step."""
+    return _get_pages(space_key, settings, "ancestors")
+
+
+def get_all_pages(space_key: str, settings: ExportSettings) -> list[dict]:
+    """Fetch page content after the user has chosen the desired scope."""
+    return _get_pages(space_key, settings, "body.export_view,ancestors")
+
+
+def top_level_parent_choices(pages: list[dict]) -> list[dict]:
+    """Return the first page-hierarchy level that offers a useful branch choice."""
+    page_ids = {page.get("id") for page in pages}
+    roots = [
+        page
+        for page in pages
+        if not any(ancestor.get("id") in page_ids for ancestor in page.get("ancestors", []))
+    ]
+    pages_by_id = {page["id"]: page for page in pages if page.get("id")}
+    children: dict[str, list[dict]] = {page_id: [] for page_id in pages_by_id}
+    for page in pages:
+        parent_id = next(
+            (ancestor.get("id") for ancestor in reversed(page.get("ancestors", []))
+             if ancestor.get("id") in pages_by_id),
+            None,
+        )
+        if parent_id:
+            children[parent_id].append(page)
+
+    # Spaces frequently have one landing page above the useful content. Follow
+    # single-child layers until the first layer where the user can choose.
+    selectable = roots
+    while len(selectable) == 1:
+        next_level = children.get(selectable[0]["id"], [])
+        if not next_level:
+            break
+        selectable = next_level
+
+    choices = []
+    for root in selectable:
+        root_id = root["id"]
+        count = sum(
+            page.get("id") == root_id
+            or any(ancestor.get("id") == root_id for ancestor in page.get("ancestors", []))
+            for page in pages
+        )
+        path = [ancestor.get("title", "") for ancestor in root.get("ancestors", [])] + [root["title"]]
+        choices.append({
+            "id": root_id,
+            "title": root["title"],
+            "path": " › ".join(part for part in path if part),
+            "page_count": count,
+        })
+    return sorted(choices, key=lambda choice: choice["title"].casefold())
+
+
+def all_parent_page_choices(pages: list[dict]) -> list[dict]:
+    """Return every current page as a possible parent for a new child page."""
+    choices = []
+    for page in pages:
+        ancestors = page.get("ancestors", [])
+        path_parts = [ancestor.get("title", "") for ancestor in ancestors] + [page["title"]]
+        choices.append({
+            "id": page["id"],
+            "title": page["title"],
+            "path": " › ".join(part for part in path_parts if part),
+            "depth": len(ancestors),
+        })
+    return sorted(choices, key=lambda choice: choice["path"].casefold())
+
+
+def create_page(
+    title: str,
+    storage_html: str,
+    parent_id: str,
+    space_key: str,
+    settings: ExportSettings,
+) -> dict:
+    """Create a child page using the Confluence storage representation."""
+    response = requests.post(
+        f"{settings.base_url}/rest/api/content",
+        headers=settings.headers,
+        verify=settings.verify,
+        timeout=60,
+        json={
+            "type": "page",
+            "title": title,
+            "space": {"key": space_key},
+            "ancestors": [{"id": parent_id}],
+            "body": {"storage": {"value": storage_html, "representation": "storage"}},
+        },
+    )
+    try:
+        response.raise_for_status()
+        return response.json()
+    finally:
+        response.close()
+
+
+def filter_pages_by_parent_ids(pages: list[dict], parent_ids: list[str]) -> list[dict]:
+    """Keep selected top-level parents and every descendant below them."""
+    selected = set(parent_ids)
+    return [
+        page
+        for page in pages
+        if page.get("id") in selected
+        or any(ancestor.get("id") in selected for ancestor in page.get("ancestors", []))
+    ]
+
+
+def _ensure_hyperlink_style(doc: Document):
+    try:
+        doc.styles["Hyperlink"]
+        return
+    except KeyError:
+        pass
+    style = OxmlElement("w:style")
+    style.set(qn("w:type"), "character")
+    style.set(qn("w:styleId"), "Hyperlink")
+    name = OxmlElement("w:name")
+    name.set(qn("w:val"), "Hyperlink")
+    style.append(name)
+    props = OxmlElement("w:rPr")
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "0563C1")
+    props.append(color)
+    underline = OxmlElement("w:u")
+    underline.set(qn("w:val"), "single")
+    props.append(underline)
+    style.append(props)
+    doc.styles.element.append(style)
+
+
+def _resolve_href(href: str, settings: ExportSettings) -> str:
+    if not href:
+        return ""
+    if href.startswith(("http://", "https://")):
+        return href
+    if href.startswith("/confluence"):
+        return settings.base_url.split("/confluence", 1)[0] + href
+    if href.startswith("/"):
+        return settings.base_url.rstrip("/") + href
+    return urljoin(settings.base_url.rstrip("/") + "/", href)
+
+
+def _sanitise_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        return urlunparse((
+            parsed.scheme, parsed.netloc,
+            quote(parsed.path, safe="/-._~:@!$&'()*+,;="),
+            parsed.params, parsed.query, parsed.fragment,
+        ))
+    except Exception:
+        return ""
+
+
+def _add_hyperlink(paragraph, url: str, display_text: str, context: ExportContext):
+    if not url or not display_text:
+        return
+    url = _sanitise_url(url)
+    if not url:
+        paragraph.add_run(display_text)
+        return
+    context.links.append((context.current_page_title, display_text.strip(), url))
+    try:
+        relationship_id = paragraph.part.relate_to(
+            url,
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+            is_external=True,
+        )
+    except Exception:
+        paragraph.add_run(display_text)
+        return
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), relationship_id)
+    run = OxmlElement("w:r")
+    properties = OxmlElement("w:rPr")
+    style = OxmlElement("w:rStyle")
+    style.set(qn("w:val"), "Hyperlink")
+    properties.append(style)
+    run.append(properties)
+    text = OxmlElement("w:t")
+    text.text = display_text
+    if display_text != display_text.strip():
+        text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    run.append(text)
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+
+
+def _download_image(url: str, settings: ExportSettings) -> tuple[io.BytesIO | None, str]:
+    """Download an image; never leak a Confluence token to external hosts."""
+    try:
+        is_confluence_host = urlparse(url).netloc.lower() == urlparse(settings.base_url).netloc.lower()
+        response = requests.get(
+            url,
+            headers=settings.headers if is_confluence_host else {},
+            verify=settings.verify,
+            timeout=60,
+            stream=True,
+        )
+        try:
+            response.raise_for_status()
+            length = response.headers.get("Content-Length")
+            if length and int(length) > MAX_IMAGE_BYTES:
+                return None, "image is larger than 15 MB"
+            content = bytearray()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                content.extend(chunk)
+                if len(content) > MAX_IMAGE_BYTES:
+                    return None, "image is larger than 15 MB"
+            return (io.BytesIO(bytes(content)), "") if content else (None, "image file is empty")
+        finally:
+            response.close()
+    except (requests.RequestException, ValueError) as error:
+        return None, str(error)
+
+
+def _add_image(paragraph, image: Tag, context: ExportContext):
+    src = image.get("src", "").strip()
+    alt = image.get("alt", "").strip()
+    url = _resolve_href(src, context.settings) if src else ""
+    error = "image has no source URL"
+    if url:
+        stream, error = _download_image(url, context.settings)
+        if stream:
+            try:
+                shape = paragraph.add_run().add_picture(stream)
+                scale = min(1, Inches(6.2) / shape.width, Inches(8.5) / shape.height)
+                if scale < 1:
+                    shape.width, shape.height = int(shape.width * scale), int(shape.height * scale)
+                if alt:
+                    paragraph.add_run(f" [Image: {alt}]")
+                return
+            except (UnrecognizedImageError, OSError, ValueError) as exception:
+                error = f"unsupported image format ({exception})"
+    paragraph.add_run(f"[Image not embedded: {alt or 'Confluence image'}; {error}. ")
+    if url:
+        _add_hyperlink(paragraph, url, "Open source image", context)
+    paragraph.add_run("]")
+
+
+def _add_text_runs(paragraph, node, context: ExportContext):
+    if isinstance(node, NavigableString):
+        value = str(node)
+        if not value:
+            return
+        run = paragraph.add_run(value)
+        for parent in node.parents:
+            if not isinstance(parent, Tag):
+                break
+            if parent.name in ("strong", "b"):
+                run.bold = True
+            if parent.name in ("em", "i"):
+                run.italic = True
+            if parent.name == "u":
+                run.underline = True
+            if parent.name in ("code", "tt"):
+                run.font.name, run.font.size = "Courier New", Pt(10)
+            if parent.name in ("p", "li", "td", "th", "div", "body"):
+                break
+        return
+    if not isinstance(node, Tag):
+        return
+    if node.name == "a":
+        href, display = node.get("href", "").strip(), node.get_text(strip=False)
+        if href and display.strip():
+            _add_hyperlink(paragraph, _resolve_href(href, context.settings), display, context)
+        else:
+            for child in node.children:
+                _add_text_runs(paragraph, child, context)
+    elif node.name == "img":
+        _add_image(paragraph, node, context)
+    else:
+        for child in node.children:
+            _add_text_runs(paragraph, child, context)
+
+
+def _process_table(doc: Document, table_tag: Tag, context: ExportContext):
+    rows = table_tag.find_all("tr")
+    if not rows:
+        return
+    columns = sum(int(cell.get("colspan", 1)) for cell in rows[0].find_all(["td", "th"]))
+    if not columns:
+        return
+    table = doc.add_table(rows=0, cols=columns)
+    table.style = "Table Grid"
+    for html_row in rows:
+        row = table.add_row()
+        column = 0
+        for html_cell in html_row.find_all(["td", "th"]):
+            if column >= columns:
+                break
+            paragraph = row.cells[column].paragraphs[0]
+            _add_text_runs(paragraph, html_cell, context)
+            if html_cell.name == "th":
+                for run in paragraph.runs:
+                    run.bold = True
+            column += int(html_cell.get("colspan", 1))
+
+
+def _process_list(doc: Document, list_tag: Tag, context: ExportContext, level: int = 0):
+    style = "List Number" if list_tag.name == "ol" else "List Bullet"
+    for item in list_tag.find_all("li", recursive=False):
+        paragraph = doc.add_paragraph(style=style)
+        paragraph.paragraph_format.left_indent = Inches(0.25 * (level + 1))
+        for child in item.children:
+            if isinstance(child, Tag) and child.name in ("ul", "ol"):
+                continue
+            _add_text_runs(paragraph, child, context)
+        for nested in item.find_all(["ul", "ol"], recursive=False):
+            _process_list(doc, nested, context, level + 1)
+
+
+def _process_element(doc: Document, element: Tag, context: ExportContext) -> bool:
+    tag = element.name
+    if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+        _add_text_runs(doc.add_paragraph(style=f"Heading {min(int(tag[1]), 4)}"), element, context)
+    elif tag == "p":
+        if element.get_text(strip=True) or element.find("img"):
+            _add_text_runs(doc.add_paragraph(), element, context)
+    elif tag == "img":
+        _add_image(doc.add_paragraph(), element, context)
+    elif tag == "pre":
+        run = doc.add_paragraph(style="No Spacing").add_run(element.get_text())
+        run.font.name, run.font.size = "Courier New", Pt(9)
+    elif tag in ("ul", "ol"):
+        _process_list(doc, element, context)
+    elif tag == "table":
+        _process_table(doc, element, context)
+        doc.add_paragraph()
+    elif tag == "hr":
+        paragraph = doc.add_paragraph()
+        border = OxmlElement("w:pBdr")
+        bottom = OxmlElement("w:bottom")
+        for key, value in (("val", "single"), ("sz", "6"), ("space", "1"), ("color", "AAAAAA")):
+            bottom.set(qn(f"w:{key}"), value)
+        border.append(bottom)
+        paragraph._p.get_or_add_pPr().append(border)
+    else:
+        return False
+    return True
+
+
+def html_to_docx(doc: Document, html: str, context: ExportContext):
+    soup = BeautifulSoup(html, "lxml")
+    queue = list((soup.find("body") or soup).children)
+    while queue:
+        node = queue.pop(0)
+        if isinstance(node, NavigableString):
+            if str(node).strip():
+                doc.add_paragraph(str(node).strip())
+        elif isinstance(node, Tag) and not _process_element(doc, node, context):
+            queue = list(node.children) + queue
+
+
+def _add_answer_guide(doc: Document, answer_depth: str):
+    profile = ANSWER_PROFILES.get(answer_depth, ANSWER_PROFILES["standard"])
+    doc.add_heading("LLM Answer Guide", level=1)
+    doc.add_paragraph(f"Preferred answer depth: {profile['label']}")
+    doc.add_heading("Required response structure", level=2)
+    for item in ("Direct answer", "Supporting details", "Source pages used", "Gaps, uncertainty, or assumptions"):
+        doc.add_paragraph(item, style="List Number")
+    doc.add_heading("Answering rules", level=2)
+    doc.add_paragraph(profile["instruction"])
+    doc.add_paragraph(
+        "Use only information supported by this knowledge base. Do not invent facts. "
+        "If information is missing, say so clearly."
+    )
+
+
+def build_knowledge_base(
+    pages: list[dict], output_file: str, space_key: str, settings: ExportSettings,
+    answer_depth: str = "standard",
+) -> int:
+    """Build and save the document, returning the number of links collected."""
+    context = ExportContext(settings=settings)
+    doc = Document()
+    _ensure_hyperlink_style(doc)
+    profile = ANSWER_PROFILES.get(answer_depth, ANSWER_PROFILES["standard"])
+    doc.core_properties.subject = f"LLM answer profile: {profile['label']}"
+    doc.core_properties.keywords = "knowledge base, LLM answer guide, sources, uncertainty"
+
+    space_title = get_space_title(space_key, settings)
+    title = doc.add_heading(space_title, level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph(f"Space: {space_key} — generated from Confluence")
+    doc.add_page_break()
+    _add_answer_guide(doc, answer_depth)
+    doc.add_page_break()
+
+    doc.add_heading("Contents", level=1)
+    for page in pages:
+        doc.add_paragraph(page["title"], style="List Number")
+    doc.add_page_break()
+
+    for page in pages:
+        context.current_page_title = page["title"]
+        doc.add_heading(page["title"], level=1)
+        ancestors = page.get("ancestors", [])
+        if ancestors:
+            path = " › ".join(ancestor["title"] for ancestor in ancestors)
+            path_paragraph = doc.add_paragraph(f"Path: {path}")
+            path_paragraph.runs[0].font.color.rgb = RGBColor(0x70, 0x70, 0x70)
+            path_paragraph.runs[0].font.size = Pt(9)
+        html = page.get("body", {}).get("export_view", {}).get("value", "")
+        if html.strip():
+            try:
+                html_to_docx(doc, html, context)
+            except Exception as error:
+                doc.add_paragraph(f"[Error processing this page: {error}]")
+        else:
+            doc.add_paragraph("[No content]")
+        doc.add_page_break()
+
+    if context.links:
+        doc.add_heading("Appendix: Links Referenced", level=1)
+        current = None
+        count = 0
+        for page_title, text, url in context.links:
+            if page_title != current:
+                current, count = page_title, 0
+                doc.add_heading(page_title, level=2)
+            count += 1
+            paragraph = doc.add_paragraph()
+            paragraph.add_run(f"{count}. {text}: ").bold = True
+            paragraph.add_run(url)
+
+    doc.save(output_file)
+    return len(context.links)

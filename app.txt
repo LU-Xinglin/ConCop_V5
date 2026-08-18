@@ -1,0 +1,318 @@
+"""Confluence Knowledge Base Portal: export spaces or create child pages."""
+
+import json
+import os
+import threading
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlparse
+
+from flask import Flask, abort, jsonify, render_template, request, send_file
+from werkzeug.utils import secure_filename
+
+import ConCop_export as exporter
+import ConfluenceWriter as writer
+
+app = Flask(__name__, template_folder=os.path.dirname(__file__))
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB uploads
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "generated")
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+CERTIFICATE_PATH = Path(__file__).with_name("hsbc-orca-g2.pem")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+jobs: dict[str, dict] = {}
+scans: dict[str, dict] = {}
+writer_jobs: dict[str, dict] = {}
+state_lock = threading.Lock()
+SCAN_LIFETIME = timedelta(minutes=30)
+
+
+def _confluence_location(space_url: str) -> tuple[str, str]:
+    """Return the Confluence base URL and space key from any page in a space."""
+    marker = "/spaces/"
+    if marker not in space_url:
+        return "", ""
+    base_url, remainder = space_url.split(marker, 1)
+    key = remainder.split("/", 1)[0].strip()
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "", ""
+    return base_url.rstrip("/"), key
+
+
+def _settings(token: str, base_url: str) -> exporter.ExportSettings:
+    return exporter.ExportSettings(
+        base_url=base_url,
+        headers={"Authorization": f"Bearer {token}"},
+        cert_path=str(CERTIFICATE_PATH),
+    )
+
+
+def _active_scan(scan_id: str) -> dict | None:
+    with state_lock:
+        scan = scans.get(scan_id)
+    if not scan or scan["created_at"] < datetime.now() - SCAN_LIFETIME:
+        return None
+    return scan
+
+
+def _remove_expired_state():
+    cutoff = datetime.now() - SCAN_LIFETIME
+    with state_lock:
+        for scan_id in [key for key, value in scans.items() if value["created_at"] < cutoff]:
+            scans.pop(scan_id, None)
+        for job_id in [key for key, value in writer_jobs.items() if value["created_at"] < cutoff]:
+            writer_jobs.pop(job_id, None)
+
+
+def _scan_space(space_url: str, token: str) -> tuple[dict, list[dict], list[dict], str]:
+    base_url, space_key = _confluence_location(space_url)
+    if not base_url or not space_key:
+        raise ValueError("The URL must contain /spaces/SPACEKEY/.")
+    if not token:
+        raise ValueError("A Confluence personal access token is required.")
+    settings = _settings(token, base_url)
+    try:
+        metadata = exporter.get_page_metadata(space_key, settings)
+        space_title = exporter.get_space_title(space_key, settings)
+    except Exception as error:
+        if exporter.is_token_error(error):
+            raise ValueError(
+                "Token verification failed. The token is invalid, expired, or does not have access to this space."
+            ) from error
+        raise
+    if not metadata:
+        raise ValueError("No current pages found. Check the token and URL.")
+    export_parents = exporter.top_level_parent_choices(metadata)
+    writer_parents = exporter.all_parent_page_choices(metadata)
+    scan = {
+        "space_key": space_key,
+        "settings": settings,
+        "export_parent_ids": {page["id"] for page in export_parents},
+        "writer_parent_ids": {page["id"] for page in writer_parents},
+        "created_at": datetime.now(),
+    }
+    return scan, export_parents, writer_parents, space_title
+
+
+def _run_export(job_id: str, scan: dict, scope: str, parent_ids: list[str], answer_depth: str):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{scan['space_key']}_{timestamp}.docx"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    try:
+        with state_lock:
+            jobs[job_id]["message"] = "Fetching selected pages from Confluence…"
+        pages = exporter.get_all_pages(scan["space_key"], scan["settings"])
+        if scope == "selected":
+            pages = exporter.filter_pages_by_parent_ids(pages, parent_ids)
+        if not pages:
+            raise ValueError("No pages matched the selected parent pages.")
+        with state_lock:
+            jobs[job_id]["message"] = f"Building document ({len(pages)} pages)…"
+        links = exporter.build_knowledge_base(
+            pages, filepath, scan["space_key"], scan["settings"], answer_depth
+        )
+        with state_lock:
+            jobs[job_id] = {
+                "status": "done", "filename": filename, "pages": len(pages), "links": links,
+                "message": f"Export complete — {len(pages)} pages and {links} links.",
+            }
+    except Exception as error:
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+        with state_lock:
+            jobs[job_id] = {"status": "error", "message": str(error)}
+
+
+def _scan_upload(writer_job_id: str, upload_path: str):
+    try:
+        with state_lock:
+            writer_jobs[writer_job_id]["message"] = "Extracting readable content from the uploaded file…"
+        extracted = writer.extract_document(upload_path)
+        with state_lock:
+            writer_jobs[writer_job_id].update({
+                "status": "ready",
+                "message": "File is ready for review.",
+                **extracted,
+            })
+    except Exception as error:
+        with state_lock:
+            writer_jobs[writer_job_id].update({"status": "error", "message": str(error)})
+    finally:
+        try:
+            os.remove(upload_path)
+        except OSError:
+            pass
+
+
+@app.get("/")
+def index():
+    return render_template("index.html")
+
+
+@app.post("/scan")
+def scan_export_space():
+    try:
+        scan, parents, _, space_title = _scan_space(
+            request.form.get("space_url", "").strip(),
+            request.form.get("token", "").strip(),
+        )
+        scan_id = str(uuid.uuid4())
+        with state_lock:
+            scans[scan_id] = scan
+        _remove_expired_state()
+        return jsonify({
+            "scan_id": scan_id, "space_title": space_title,
+            "total_pages": len(scan["writer_parent_ids"]), "parents": parents,
+        })
+    except Exception as error:
+        return jsonify({"error": f"Could not scan this space: {error}"}), 400
+
+
+@app.post("/writer/scan")
+def scan_writer_space():
+    try:
+        scan, _, parents, space_title = _scan_space(
+            request.form.get("space_url", "").strip(),
+            request.form.get("token", "").strip(),
+        )
+        scan_id = str(uuid.uuid4())
+        with state_lock:
+            scans[scan_id] = scan
+        _remove_expired_state()
+        return jsonify({
+            "scan_id": scan_id, "space_title": space_title,
+            "total_pages": len(parents), "parents": parents,
+        })
+    except Exception as error:
+        return jsonify({"error": f"Could not scan this space: {error}"}), 400
+
+
+@app.post("/export")
+def start_export():
+    scan = _active_scan(request.form.get("scan_id", "").strip())
+    scope = request.form.get("scope", "all")
+    answer_depth = request.form.get("answer_depth", "standard")
+    try:
+        parent_ids = json.loads(request.form.get("selected_parent_ids", "[]"))
+    except json.JSONDecodeError:
+        return jsonify({"error": "The page selection is invalid. Please scan again."}), 400
+    if not scan:
+        return jsonify({"error": "This scan has expired. Please scan the space again."}), 400
+    if scope not in {"all", "selected"} or answer_depth not in exporter.ANSWER_PROFILES:
+        return jsonify({"error": "The export choices are invalid."}), 400
+    if not isinstance(parent_ids, list) or not all(isinstance(item, str) for item in parent_ids):
+        return jsonify({"error": "The page selection is invalid."}), 400
+    if scope == "selected" and (not parent_ids or not set(parent_ids).issubset(scan["export_parent_ids"])):
+        return jsonify({"error": "Choose one or more parent pages from this scan."}), 400
+    job_id = str(uuid.uuid4())
+    with state_lock:
+        jobs[job_id] = {"status": "running", "message": "Export started…"}
+    threading.Thread(target=_run_export, args=(job_id, scan, scope, parent_ids, answer_depth), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.post("/writer/preview")
+def preview_writer_file():
+    scan = _active_scan(request.form.get("scan_id", "").strip())
+    parent_id = request.form.get("parent_id", "").strip()
+    page_title = request.form.get("page_title", "").strip()
+    upload = request.files.get("file")
+    if not scan:
+        return jsonify({"error": "This scan has expired. Please scan the space again."}), 400
+    if parent_id not in scan["writer_parent_ids"]:
+        return jsonify({"error": "Choose a parent page from this scan."}), 400
+    if not page_title:
+        return jsonify({"error": "Enter a title for the new Confluence page."}), 400
+    if not upload or not upload.filename:
+        return jsonify({"error": "Choose a Word, PowerPoint, or PDF file."}), 400
+    filename = secure_filename(upload.filename)
+    if Path(filename).suffix.lower() not in writer.SUPPORTED_EXTENSIONS:
+        return jsonify({"error": "Supported file types are .docx, .pptx, and .pdf."}), 400
+    job_id = str(uuid.uuid4())
+    upload_path = os.path.join(UPLOAD_DIR, f"{job_id}_{filename}")
+    upload.save(upload_path)
+    with state_lock:
+        writer_jobs[job_id] = {
+            "status": "running", "message": "File upload complete; scanning content…",
+            "created_at": datetime.now(), "scan": scan, "parent_id": parent_id,
+        }
+    threading.Thread(target=_scan_upload, args=(job_id, upload_path), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.get("/writer/status/<job_id>")
+def writer_status(job_id: str):
+    with state_lock:
+        job = writer_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "File job not found."}), 404
+        response = {key: value for key, value in job.items() if key not in {"scan", "storage_html", "created_at"}}
+        if job["status"] == "ready":
+            response["preview_html"] = job["storage_html"]
+    return jsonify(response)
+
+
+@app.post("/writer/create")
+def create_writer_page():
+    writer_job_id = request.form.get("writer_job_id", "").strip()
+    page_title = request.form.get("page_title", "").strip()
+    edited_html = request.form.get("storage_html", "").strip()
+    with state_lock:
+        job = writer_jobs.get(writer_job_id)
+    if not job or job.get("status") != "ready":
+        return jsonify({"error": "This file preview is no longer available. Upload it again."}), 400
+    if not page_title:
+        return jsonify({"error": "Enter a title for the new Confluence page."}), 400
+    if not edited_html:
+        return jsonify({"error": "The page content cannot be empty."}), 400
+    try:
+        page = exporter.create_page(
+            page_title, edited_html, job["parent_id"],
+            job["scan"]["space_key"], job["scan"]["settings"],
+        )
+        webui = page.get("_links", {}).get("webui", "")
+        page_url = ""
+        if webui:
+            parsed = urlparse(job["scan"]["settings"].base_url)
+            page_url = f"{parsed.scheme}://{parsed.netloc}{webui}"
+        return jsonify({"page_id": page.get("id"), "page_url": page_url, "title": page.get("title", page_title)})
+    except Exception as error:
+        return jsonify({"error": f"Could not create the Confluence page: {error}"}), 400
+
+
+@app.get("/status/<job_id>")
+def job_status(job_id: str):
+    with state_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found."}), 404
+    return jsonify(job)
+
+
+@app.get("/download/<job_id>")
+def download(job_id: str):
+    with state_lock:
+        job = jobs.get(job_id)
+    if not job or job.get("status") != "done":
+        abort(404)
+    filepath = os.path.join(OUTPUT_DIR, job["filename"])
+    if not os.path.isfile(filepath):
+        abort(404)
+    return send_file(filepath, as_attachment=True, download_name=job["filename"],
+                     mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                     conditional=False)
+
+
+@app.errorhandler(413)
+def file_too_large(_error):
+    return jsonify({"error": "The uploaded file is larger than the 50 MB limit."}), 413
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)

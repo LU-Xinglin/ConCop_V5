@@ -268,16 +268,9 @@ def create_writer_page():
         return jsonify({"error": "This file preview is no longer available. Upload it again."}), 400
     if not page_title:
         return jsonify({"error": "Enter a title for the new Confluence page."}), 400
-    # The extracted storage HTML has already been generated in Confluence's
-    # accepted format.  Only replace it when the user actually edited the
-    # preview; re-serialising an untouched rich preview in the browser can
-    # make Confluence reject otherwise valid table/list markup.
-    edited_html = request.form.get("storage_html", "").strip() or job.get("storage_html", "")
-    if not edited_html:
-        return jsonify({"error": "The page content cannot be empty."}), 400
     try:
         page = exporter.create_page(
-            page_title, edited_html, job["parent_id"],
+            page_title, job["storage_html"], job["parent_id"],
             job["scan"]["space_key"], job["scan"]["settings"],
         )
         webui = page.get("_links", {}).get("webui", "")

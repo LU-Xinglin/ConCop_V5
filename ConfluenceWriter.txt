@@ -10,7 +10,10 @@ SUPPORTED_EXTENSIONS = {".docx", ".pptx", ".pdf"}
 
 
 def _escape(value: str) -> str:
-    return html.escape(value, quote=False).replace("\n", "<br/>")
+    # PowerPoint exposes Shift+Enter soft line breaks as vertical tabs (\v).
+    # They are not valid in Confluence's XML storage format, so render both
+    # kinds of line break as Confluence-safe HTML before escaping text.
+    return html.escape(value, quote=False).replace("\n", "<br/>").replace("\v", "<br/>")
 
 
 def _table_html(rows: list[list[str]]) -> str:
